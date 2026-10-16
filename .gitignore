@@ -1,0 +1,16 @@
+# Maven
+target/
+
+# IntelliJ IDEA
+.idea/
+*.iml
+
+# Logs
+*.log
+
+# Compiled output
+*.class
+
+# OS
+.DS_Store
+Thumbs.db

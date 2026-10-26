@@ -38,6 +38,8 @@ class ReadStrategyModuleTest {
         final CopyOnWriteArrayList<String> misses = new CopyOnWriteArrayList<>();
         volatile Exception sourceError;
         volatile boolean returnNull;
+        /** 回源耗时，用于给 SingleFlight 制造并发合并窗口（默认 0 表示不延迟）。 */
+        volatile long loadDelayMillis;
         final Duration defaultTtl = Duration.ofMinutes(30);
         final Duration nullTtl = Duration.ofMinutes(1);
 
@@ -65,6 +67,9 @@ class ReadStrategyModuleTest {
 
         @Override public VersionedValue<V> loadFromSource(K key) throws Exception {
             loads.incrementAndGet();
+            if (loadDelayMillis > 0L) {
+                Thread.sleep(loadDelayMillis);
+            }
             if (returnNull) {
                 return null;
             }
@@ -183,6 +188,8 @@ class ReadStrategyModuleTest {
     void singleFlight_coalescesConcurrentLoads() throws Exception {
         RecordingReadContext<String, String> ctx = new RecordingReadContext<>();
         ctx.source.put("k", new VersionedValue<>("db-value", 4L));
+        // 给回源加 100ms 延迟，确保 4 个线程落在同一合并窗口内（否则线程串行时断言必然抖动）
+        ctx.loadDelayMillis = 100L;
         SingleFlight<String, String> sf = new SingleFlight<>();
         CacheAsideReadStrategy<String, String> strategy = new CacheAsideReadStrategy<>(sf);
 

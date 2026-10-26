@@ -1,0 +1,21 @@
+ooohyg-cache
+Copyright 2026 Yeti11H
+
+This product is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text.
+
+--------------------------------------------------------------------------------
+Third-party acknowledgements
+
+This project's architecture is inspired by JetCache (https://github.com/alibaba/jetcache),
+which is licensed under the Apache License, Version 2.0.
+No source code from JetCache is copied into this project.
+
+Runtime dependencies (all Apache License 2.0 unless noted):
+  - Caffeine            https://github.com/ben-manes/caffeine
+  - Jackson Databind    https://github.com/FasterXML/jackson
+  - Lettuce             https://github.com/redis/lettuce
+  - Micrometer          https://github.com/micrometer-metrics/micrometer
+
+Test dependencies:
+  - JUnit 5 (Eclipse Public License 2.0)  https://github.com/junit-team/junit5

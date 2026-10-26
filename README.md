@@ -319,6 +319,7 @@ L1 TTL 通常短于 L2 TTL，避免本地实例长期保留旧数据；真正需
 - [x] 空值缓存与内存布隆过滤器
 - [x] `FailurePolicy` 降级和旧值兜底
 - [x] Testcontainers + Redis 集成测试
+- [x] 可直接运行的内存演示程序（6 个场景 + 汇总表，见下节）
 
 ### 当前边界
 
@@ -331,6 +332,69 @@ L1 TTL 通常短于 L2 TTL，避免本地实例长期保留旧数据；真正需
 - [ ] 指标目前是内存实现，尚未接入 Micrometer
 - [ ] 日志仍需统一为 SLF4J 结构化日志
 - [ ] 布隆过滤器为内存实现，重启后需要重新构建
+
+## 可运行演示（Demo）
+
+仓库自带一个纯内存、可直接运行的演示程序 `CacheDemo`，把六条核心链路完整跑一遍：**不需要 Redis、不需要 Docker、不需要任何外部配置**。
+
+- 源码位置：`src/main/java/io/github/ooohyg/distributed/cache/demo/CacheDemo.java`
+- 主类：`io.github.ooohyg.distributed.cache.demo.CacheDemo`
+- 组件组装：L1 = `ConcurrentHashMapL1Cache`，L2 = `InMemoryL2Cache`，数据源 = 内存实现（同时实现 `SourceReader` / `SourceWriter`），失效总线 = `InMemoryInvalidationBus`，指标 = 演示用计数实现（打印命中、回源、失效次数）
+
+### 运行
+
+一条命令即可（编译并运行 `demo` 包下的 `CacheDemo`）：
+
+```bash
+mvn compile exec:java
+```
+
+主类已在 `pom.xml` 的 `exec-maven-plugin` 中通过属性 `exec.mainClass` 配置好，不需要手工拼 classpath，也不需要本地安装 Redis。
+
+需要临时换主类或追加参数时：
+
+```bash
+mvn compile exec:java -Dexec.mainClass=io.github.ooohyg.distributed.cache.demo.CacheDemo
+```
+
+也可以在 IDE 中直接运行 `CacheDemo#main`，Maven 会自动带上依赖。
+
+> 终端是 GBK 代码页的 cmd 时，如看到中文乱码先执行 `chcp 65001`（程序内部已固定按 UTF-8 输出）。
+
+<details>
+<summary>备选：不使用 exec 插件，手工拼 classpath 运行</summary>
+
+```bash
+mvn -q -DskipTests compile
+mvn -q org.apache.maven.plugins:maven-dependency-plugin:3.8.1:build-classpath -Dmdep.outputFile=target/demo-classpath.txt
+java -Dfile.encoding=UTF-8 -cp "target/classes:$(cat target/demo-classpath.txt)" io.github.ooohyg.distributed.cache.demo.CacheDemo
+```
+
+Windows PowerShell：
+
+```powershell
+mvn -q -DskipTests compile
+mvn -q org.apache.maven.plugins:maven-dependency-plugin:3.8.1:build-classpath "-Dmdep.outputFile=target/demo-classpath.txt"
+$cp = "target\classes;" + (Get-Content target\demo-classpath.txt -Raw).Trim()
+java "-Dfile.encoding=UTF-8" -cp $cp io.github.ooohyg.distributed.cache.demo.CacheDemo
+```
+
+</details>
+
+### 演示内容
+
+| 场景 | 演示内容 | 观察点 |
+| --- | --- | --- |
+| 1 | 冷读穿透回源 + 逐层回填 | 首次 `get` 回源并回填 L2 / L1；二次 `get` 命中 L1，回源次数不再增长 |
+| 2 | 并发同 Key 回源合并 | 16 个线程同时读同一 Key，L3 只被调用 1 次，SingleFlight 合并 15 次 |
+| 3 | 空值占位防穿透 | 查询不存在的 Key 只回源 1 次，后续命中空值占位直接返回 `Optional.empty()` |
+| 4 | 写触发清除 + 失效广播 | 实例 A 写入后 A / B 的 L1 与共享 L2 全部被清除，B 重新读取拿到新值 |
+| 5 | 旧版本失效事件被丢弃 | 晚到的低版本事件被忽略、L1 保留；新版本事件正常清除 |
+| 6 | 源故障降级返回旧值 | 数据源抛异常时用旧值兜底返回，业务侧不感知异常 |
+
+每个场景输出分段标题、链路说明和关键指标（回源次数、命中情况、耗时），最后打印汇总表（各场景结果、L3 回源次数、命中率）。
+
+> 说明：场景 2 与场景 5 的请求均为首次访问（并发冷读、失效后重建），命中率为 0 属于预期结果，不代表缓存未生效。
 
 ## 构建与测试
 

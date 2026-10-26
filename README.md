@@ -12,34 +12,27 @@
 ## 架构总览
 
 ```mermaid
-flowchart TB
-    Client["业务请求"]
+graph TD
+    Client[业务代码] --> |get / put| Facade[Cache<K,V> 接口]
 
-    Bloom["Bloom 布隆过滤器"]
-    SingleFlight["SingleFlight"]
-    L1["L1 Caffeine"]
-    L2["L2 Redis"]
-    L3["L3 数据源"]
-    Delay["延迟双删 Delay"]
-    Outbox["Outbox 消息总线"]
-    PubSub["Redis Pub/Sub"]
+    Facade --> |委托| Orchestrator[MultiLevelCache 编排器]
 
-    Client --> Bloom
-    Bloom -->|"可能存在"| L1
-    Bloom -->|"一定不存在，直接返回"| Empty["返回空值"]
-    L1 -->|"未命中"| L2
-    L2 -->|"未命中"| SingleFlight
-    SingleFlight --> L3
-    L3 -->|"回填"| L2
-    L2 -->|"回填"| L1
+    Orchestrator --> ReadStrategy[读策略装饰器链]
+    Orchestrator --> WriteStrategy[写策略装饰器链]
 
-    Client -->|"写请求"| L3
-    L3 --> Delay
-    Delay -->|"删除"| L2
-    Delay -->|"删除"| L1
-    Delay --> Outbox
-    Outbox --> PubSub
-    PubSub -->|"广播失效事件"| L1
+    ReadStrategy --> |1. 穿透校验| Bloom[布隆过滤器]
+    Bloom --> |2. 并发合并| SingleFlight[SingleFlight]
+    SingleFlight --> |3. 逐级查找| L1[L1 Caffeine 本地缓存]
+    SingleFlight --> |4. 逐级查找| L2[L2 Redis 分布式缓存]
+    SingleFlight --> |5. 回源| L3[L3 数据源]
+
+    WriteStrategy --> |1. 落库| L3
+    WriteStrategy --> |2. 删缓存| L1
+    WriteStrategy --> |3. 删缓存| L2
+    WriteStrategy --> |4. 延迟双删| Delay[延迟任务]
+    WriteStrategy --> |5. 可靠广播| Outbox[Outbox 消息总线]
+
+    Outbox --> |发布失效事件| RedisPubSub((Redis Pub/Sub))
 ```
 
 要点说明：

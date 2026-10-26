@@ -11,71 +11,35 @@
 
 ## 架构总览
 
-下图按仓库中**已实现**的类绘制：实线为已实现并接入编排的组件，虚线表示装饰关系或规划项。
-
 ```mermaid
 flowchart TB
-    App["业务代码<br/>Cache&lt;K,V&gt;"]
-    MC["MultiLevelCache<br/>编排器"]
+    Client["业务请求"]
 
-    App --> MC
+    Bloom["Bloom 布隆过滤器"]
+    SingleFlight["SingleFlight"]
+    L1["L1 Caffeine"]
+    L2["L2 Redis"]
+    L3["L3 数据源"]
+    Delay["延迟双删 Delay"]
+    Outbox["Outbox 消息总线"]
+    PubSub["Redis Pub/Sub"]
 
-    subgraph READPATH["读路径"]
-        direction TB
-        RS["CacheAsideReadStrategy"]
-        SF["SingleFlight<br/>同 Key 并发请求合并"]
-        L1["L1 本地缓存<br/>ConcurrentHashMapL1Cache / CaffeineL1Cache"]
-        L2["L2 远程缓存<br/>InMemoryL2Cache / RedisL2Cache（Lettuce）"]
-        L3["L3 数据源<br/>SourceReader"]
-        RS --> SF
-        SF --> L1
-        L1 -->|miss| L2
-        L2 -->|miss| L3
-        L3 -->|回填 L2 与 L1| L2
-        L2 -->|回填 L1| L1
-    end
+    Client --> Bloom
+    Bloom -->|"可能存在"| L1
+    Bloom -->|"一定不存在，直接返回"| Empty["返回空值"]
+    L1 -->|"未命中"| L2
+    L2 -->|"未命中"| SingleFlight
+    SingleFlight --> L3
+    L3 -->|"回填"| L2
+    L2 -->|"回填"| L1
 
-    subgraph WRITEPATH["写路径"]
-        direction TB
-        WS["CacheAsideWriteStrategy<br/>写数据源后删除缓存"]
-        DD["DoubleDeleteWriteStrategy<br/>延迟双删装饰器"]
-        SW["SourceWriter"]
-        WS --> SW
-        WS -->|删除| L2
-        WS -->|删除| L1
-        DD -. 装饰 .-> WS
-    end
-
-    subgraph EVENTPATH["失效广播"]
-        direction TB
-        PUB["CacheInvalidationPublisher"]
-        OB["OutboxInvalidationPublisher<br/>内存 Outbox + 后台重试"]
-        BUS["InMemoryInvalidationBus<br/>RedisPubSubInvalidationBus"]
-        GUARD["eventId 幂等 / 指纹校验 / version 乱序丢弃"]
-        PUB --> BUS
-        OB -. 装饰 .-> PUB
-        BUS --> GUARD
-        GUARD -->|清除其他实例的 L1| L1
-    end
-
-    subgraph PROTECT["防护与观测"]
-        direction TB
-        PG["CachePenetrationGuard<br/>BloomFilterPenetrationGuard（内存 BitSet）+ 空值占位"]
-        AV["CacheAvalancheGuard<br/>JitterTtlAvalancheGuard 抖动 TTL"]
-        FP["FailurePolicy<br/>失败时 peekStale 返回旧值"]
-        MET["CacheMetrics<br/>NoOpCacheMetrics / MicrometerCacheMetrics"]
-    end
-
-    MC --> RS
-    MC --> WS
-    MC --> PUB
-    MC --> PG
-    MC --> AV
-    MC --> FP
-    MC --> MET
-
-    ROAD["规划中（当前未实现）<br/>逻辑过期与后台刷新<br/>热点 Key 保护<br/>CacheBreakdownGuard 的分布式锁实现<br/>Outbox 持久化 / CDC 对账<br/>Redis 位图布隆过滤器"]
-    ROAD -.-> MC
+    Client -->|"写请求"| L3
+    L3 --> Delay
+    Delay -->|"删除"| L2
+    Delay -->|"删除"| L1
+    Delay --> Outbox
+    Outbox --> PubSub
+    PubSub -->|"广播失效事件"| L1
 ```
 
 要点说明：
@@ -83,7 +47,7 @@ flowchart TB
 - **L1 / L2 / 总线 / 指标都是接口 + 多实现**：默认演示链路全部走内存实现，把 L2 换成 `RedisL2Cache`、总线换成 `RedisPubSubInvalidationBus` 即可跨实例部署，业务代码不变。
 - **一致性由三段共同保证**：写路径删除 + 广播通知，`eventId` 处理重复事件，`version` 处理乱序事件，指纹校验拦截同 ID 不同内容的事件。
 - **降级是显式组件**：`FailurePolicy` 在数据源异常时通过 `peekStale` 取旧值返回，而不是把异常抛给业务。
-- **图中未出现的组件尚未实现**（见 [路线图](#路线图)）：逻辑过期、热点 Key 保护、分布式锁形式的击穿防护、Outbox 持久化。
+- **逻辑过期的实现状态**见 [逻辑过期](#逻辑过期) 章节。
 
 ## 为什么做这个项目
 
@@ -153,6 +117,84 @@ eventId 去重 → 指纹校验 → version 比较
 ```
 
 `Redis Pub/Sub` 适合演示跨实例通知，但属于尽力而为的通道。生产环境可以把 `CacheInvalidationBus` 替换为 Kafka、RocketMQ，或接入 Outbox/CDC 做可靠投递和补偿。
+
+## 逻辑过期
+
+`CacheEntry` 同时记录两个时间戳，把"能不能用"和"要不要刷新"分开：
+
+| 字段 | 含义 | 行为 |
+|---|---|---|
+| `logicalExpireAtMillis` | 逻辑过期时间 | 到期后条目仍可对外服务，用于触发后台刷新 |
+| `physicalExpireAtMillis` | 物理过期时间 | 到期后条目必须被淘汰，不再返回 |
+
+逻辑过期针对的是热点 Key 到期瞬间大量请求同时回源（缓存击穿）。设计流程：
+
+```text
+get(key)
+      ↓
+命中 L1/L2 且 now < logicalExpireAtMillis  → 直接返回
+      ↓
+命中但已过逻辑过期时间
+      ↓
+先返回旧值（可能不最新）→ 异步触发 SingleFlight 回源 → 回填新版本
+      ↓
+未命中 → 走正常回源链路（L1 → L2 → L3）
+```
+
+当前状态：`CacheEntry` 已保留 `logicalExpireAtMillis` 字段，读路径以物理过期时间判定，逻辑过期 + 后台刷新尚未接入（见 [路线图](#路线图) 第 2 项）。接入时无需改动 `Cache` 接口，只需在 `CacheAsideReadStrategy` 中增加"已过逻辑过期但仍可读"的分支，并复用 `SingleFlight` 合并刷新请求，避免并发回源。
+
+## 可靠链路（Outbox）
+
+Pub/Sub 是尽力而为的通道，实例宕机或网络抖动会丢事件，导致其他实例的 L1 残留旧值。Outbox 的做法是**事件先落本地消息表，再由后台线程投递，失败保留重试**，把业务写入与事件发送解耦：
+
+```text
+业务写入
+      ↓
+写 L3 数据源
+      ↓
+删除 L2 / L1
+      ↓
+写入 Outbox（本地消息表）
+      ↓
+后台 relay 线程循环投递 → CacheInvalidationBus
+      ↓
+成功则移除记录；失败保留，下一轮重试
+```
+
+相关类：
+
+| 类 | 作用 |
+|---|---|
+| `OutboxInvalidationPublisher` | 装饰 `CacheInvalidationPublisher`，事件先进 Outbox 再由后台线程重试投递 |
+| `CacheInvalidationPublisher` | 投递接口，可替换为 Kafka / RocketMQ 等可靠通道 |
+| `RedisPubSubInvalidationBus` | 演示用的跨实例总线，尽力而为 |
+| eventId 指纹校验 | 重复投递时按 `eventId` 去重，避免同一事件重复清理 |
+
+当前边界：Outbox 是内存表，进程重启会丢失，生产需落库并配合定时对账与 CDC 补偿（见 [路线图](#路线图) 第 4 项）；投递语义为"至少一次"，消费端依赖 `eventId` 幂等。
+
+## 指标监控
+
+`CacheMetrics` 是接口，默认 `NoOpCacheMetrics`，可换成 `MicrometerCacheMetrics` 对接 Micrometer：
+
+| 指标方法 | 含义 | 用途 |
+|---|---|---|
+| `recordHit` / `recordMiss` | 按 level（L1 / L2）统计命中与未命中 | 计算各层命中率 |
+| `recordNullHit` | 空值占位命中次数 | 衡量穿透防护效果 |
+| `recordLoadTime` | 回源（Loader）耗时 | 定位慢数据源 |
+| `recordLoadFailure` | 回源失败次数 | 判断降级是否被触发 |
+| `recordSingleFlightMerge` | 被合并的并发请求数 | 衡量并发削峰效果 |
+| `recordInvalidation` | 失效事件处理次数 | 观察一致性传播是否正常 |
+| `recordStaleEventIgnored` | 乱序/过旧事件被丢弃次数 | 观察事件乱序程度 |
+
+接入方式：把 metrics 作为构造参数传入即可，业务代码无需改动。
+
+```java
+CacheMetrics metrics = new MicrometerCacheMetrics(meterRegistry);
+MultiLevelCache<String, Order> cache = new MultiLevelCache<>(
+        l1, l2, reader, writer, readStrategy, writeStrategy, publisher, metrics);
+```
+
+告警建议：L3 回源次数突增（可能被击穿或雪崩）、L1 命中率骤降（可能失效广播异常导致频繁清理）、`recordLoadFailure` 持续增长（数据源不稳定）、`recordStaleEventIgnored` 持续增长（事件乱序严重）。
 
 ## 快速开始
 
@@ -508,7 +550,9 @@ mvn -q test
 
 本项目基于 [Apache License 2.0](./LICENSE) 发布：允许商用、修改与再分发，需保留版权声明与许可文本。第三方组件与致谢明细见 [NOTICE](./NOTICE)。
 
-> 声明：本项目在设计思路上参考了 JetCache 的分层缓存与失效广播模型，**核心代码完全独立实现，未复用 JetCache 的任何源码**。
+This project is licensed under the Apache License 2.0.
+
+> 声明：本项目的设计参考了 JetCache，但核心代码完全独立实现，未复用其源码。
 
 感谢以下项目提供的工程参考：
 

@@ -162,7 +162,7 @@ public class MultiLevelCache<K, V> implements Cache<K, V>, CacheInvalidationSubs
             if (existingFingerprint.equals(fingerprint)) {
                 return;
             } else {
-                log.warn("eventId collision detected: eventId={}, existingFingerprint={}, incomingFingerprint={}",
+                log.warn("缓存失效事件 ID 冲突！eventId={}, 旧指纹={}, 新指纹={}",
                         event.eventId(), existingFingerprint, fingerprint);
                 return;
             }

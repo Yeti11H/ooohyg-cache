@@ -48,7 +48,7 @@ public class OutboxInvalidationPublisher implements CacheInvalidationPublisher {
                             outbox.remove(entry.getKey());      // 发送成功，删除记录
                         } catch (Exception e) {
                             // 发送失败：保留在 Outbox 中，下次循环重试
-                            log.warn("Outbox relay failed, will retry: eventId={}", entry.getKey(), e);
+                            log.warn("缓存失效事件发送失败，将保留在 Outbox 中重试：eventId={}", entry.getKey(), e);
                         }
                     }
                 } catch (InterruptedException e) {

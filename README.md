@@ -9,7 +9,84 @@
 [![Redis](https://img.shields.io/badge/L2-Redis-red)](https://redis.io/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](./LICENSE)
 
+## 架构总览
+
+下图按仓库中**已实现**的类绘制：实线为已实现并接入编排的组件，虚线表示装饰关系或规划项。
+
+```mermaid
+flowchart TB
+    App["业务代码<br/>Cache&lt;K,V&gt;"]
+    MC["MultiLevelCache<br/>编排器"]
+
+    App --> MC
+
+    subgraph READPATH["读路径"]
+        direction TB
+        RS["CacheAsideReadStrategy"]
+        SF["SingleFlight<br/>同 Key 并发请求合并"]
+        L1["L1 本地缓存<br/>ConcurrentHashMapL1Cache / CaffeineL1Cache"]
+        L2["L2 远程缓存<br/>InMemoryL2Cache / RedisL2Cache（Lettuce）"]
+        L3["L3 数据源<br/>SourceReader"]
+        RS --> SF
+        SF --> L1
+        L1 -->|miss| L2
+        L2 -->|miss| L3
+        L3 -->|回填 L2 与 L1| L2
+        L2 -->|回填 L1| L1
+    end
+
+    subgraph WRITEPATH["写路径"]
+        direction TB
+        WS["CacheAsideWriteStrategy<br/>写数据源后删除缓存"]
+        DD["DoubleDeleteWriteStrategy<br/>延迟双删装饰器"]
+        SW["SourceWriter"]
+        WS --> SW
+        WS -->|删除| L2
+        WS -->|删除| L1
+        DD -. 装饰 .-> WS
+    end
+
+    subgraph EVENTPATH["失效广播"]
+        direction TB
+        PUB["CacheInvalidationPublisher"]
+        OB["OutboxInvalidationPublisher<br/>内存 Outbox + 后台重试"]
+        BUS["InMemoryInvalidationBus<br/>RedisPubSubInvalidationBus"]
+        GUARD["eventId 幂等 / 指纹校验 / version 乱序丢弃"]
+        PUB --> BUS
+        OB -. 装饰 .-> PUB
+        BUS --> GUARD
+        GUARD -->|清除其他实例的 L1| L1
+    end
+
+    subgraph PROTECT["防护与观测"]
+        direction TB
+        PG["CachePenetrationGuard<br/>BloomFilterPenetrationGuard（内存 BitSet）+ 空值占位"]
+        AV["CacheAvalancheGuard<br/>JitterTtlAvalancheGuard 抖动 TTL"]
+        FP["FailurePolicy<br/>失败时 peekStale 返回旧值"]
+        MET["CacheMetrics<br/>NoOpCacheMetrics / MicrometerCacheMetrics"]
+    end
+
+    MC --> RS
+    MC --> WS
+    MC --> PUB
+    MC --> PG
+    MC --> AV
+    MC --> FP
+    MC --> MET
+
+    ROAD["规划中（当前未实现）<br/>逻辑过期与后台刷新<br/>热点 Key 保护<br/>CacheBreakdownGuard 的分布式锁实现<br/>Outbox 持久化 / CDC 对账<br/>Redis 位图布隆过滤器"]
+    ROAD -.-> MC
+```
+
+要点说明：
+
+- **L1 / L2 / 总线 / 指标都是接口 + 多实现**：默认演示链路全部走内存实现，把 L2 换成 `RedisL2Cache`、总线换成 `RedisPubSubInvalidationBus` 即可跨实例部署，业务代码不变。
+- **一致性由三段共同保证**：写路径删除 + 广播通知，`eventId` 处理重复事件，`version` 处理乱序事件，指纹校验拦截同 ID 不同内容的事件。
+- **降级是显式组件**：`FailurePolicy` 在数据源异常时通过 `peekStale` 取旧值返回，而不是把异常抛给业务。
+- **图中未出现的组件尚未实现**（见 [路线图](#路线图)）：逻辑过期、热点 Key 保护、分布式锁形式的击穿防护、Outbox 持久化。
+
 ## 为什么做这个项目
+
 
 多级缓存真正困难的地方不在于把数据放进 Redis，而在于处理缓存层之间的失效、并发和故障：
 
@@ -37,29 +114,7 @@
 | 可插拔 | 读写策略、失效总线、序列化、指标和防护组件均通过接口注入 |
 | 轻量核心 | 不依赖 Spring；核心实现基于 JDK、Caffeine、Lettuce 和 Jackson |
 
-## 架构
-
-```mermaid
-flowchart TB
-    A[业务代码\nCache<K,V>] --> B[MultiLevelCache\n缓存编排器]
-
-    B --> C[ReadStrategy]
-    B --> D[WriteStrategy]
-    B --> E[FailurePolicy]
-    B --> F[Protection\nSingleFlight / 穿透 / 雪崩]
-    B --> G[Metrics]
-
-    C --> L1[L1 本地缓存\nCaffeine / ConcurrentHashMap]
-    L1 -->|miss| L2[L2 远程缓存\nRedis / InMemory]
-    L2 -->|miss| L3[L3 数据源\nSourceReader / SourceWriter]
-
-    D --> L3
-    D -->|删除| L2
-    D -->|删除| L1
-    D --> H[InvalidationBus\nInMemory / Redis Pub/Sub]
-    H --> L1
-    H --> L2
-```
+## 关键链路
 
 ### 读取链路
 
@@ -97,7 +152,7 @@ eventId 去重 → 指纹校验 → version 比较
 删除对应 L1/L2 条目
 ```
 
-`Redis Pub/Sub` 适合演示跨实例通知，但属于尽力而为的通道。生产环境可以把 `InvalidationBus` 替换为 Kafka、RocketMQ，或接入 Outbox/CDC 做可靠投递和补偿。
+`Redis Pub/Sub` 适合演示跨实例通知，但属于尽力而为的通道。生产环境可以把 `CacheInvalidationBus` 替换为 Kafka、RocketMQ，或接入 Outbox/CDC 做可靠投递和补偿。
 
 ## 快速开始
 
@@ -122,36 +177,54 @@ eventId 去重 → 指纹校验 → version 比较
 - Caffeine `3.1.8`
 - Lettuce `6.3.2.RELEASE`
 - Jackson Databind `2.17.2`
+- Micrometer `1.12.5`
+- SLF4J API `2.0.13` + Logback Classic `1.4.14`（日志门面 + 默认控制台实现）
 
 ### 内存版示例
 
 内存实现适合学习和单元测试。生产环境只需要把 L2 和失效总线替换为 Redis 实现。
 
 ```java
-CacheLevel<String, String> l1 = new CaffeineL1Cache<>();
+CacheLevel<String, String> l1 = new ConcurrentHashMapL1Cache<>();
 CacheLevel<String, String> l2 = new InMemoryL2Cache<>();
+CacheMetrics metrics = new NoOpCacheMetrics();
 
-InMemorySourceReader<String, String> source = new InMemorySourceReader<>();
-InMemoryInvalidationBus bus = new InMemoryInvalidationBus();
-SimpleCacheMetrics metrics = new SimpleCacheMetrics();
+// L3 数据源：用 Map 模拟，真实场景替换为数据库/远程服务；版本号由数据源维护
+Map<String, String> db = new ConcurrentHashMap<>();
+Map<String, Long> versions = new ConcurrentHashMap<>();
+
+SourceReader<String, String> reader = key -> {
+    String value = db.get(key);
+    return value == null ? null : new VersionedValue<>(value, versions.get(key));
+};
+SourceWriter<String, String> writer = (key, value) -> {
+    db.put(key, value);
+    return new VersionedValue<>(value, versions.merge(key, 1L, Long::sum));
+};
+
+CacheInvalidationBus bus = new InMemoryInvalidationBus();
 
 Cache<String, String> cache = new MultiLevelCache<>(
         l1,
         l2,
-        source,
-        source::put,
+        reader,
+        writer,
         new CacheAsideReadStrategy<>(new SingleFlight<>()),
-        new CacheAsideWriteStrategy(),
+        new CacheAsideWriteStrategy<>(),
         bus,
         metrics
 );
 
-source.put("user:1", "Alice");
+db.put("user:1", "Alice");
+versions.put("user:1", 1L);
+
 System.out.println(cache.get("user:1")); // Optional[Alice]
 
 cache.put("user:1", "Alice2");
 System.out.println(cache.get("user:1")); // Optional[Alice2]
 ```
+
+完整可运行版本见 [`CacheDemo`](src/main/java/io/github/ooohyg/distributed/cache/demo/CacheDemo.java)，它用同一套内存组件跑通六条链路。
 
 ### Redis 版组装方式
 
@@ -187,12 +260,12 @@ RedisPubSubInvalidationBus bus = new RedisPubSubInvalidationBus(
 Cache<String, String> cache = new MultiLevelCache<>(
         new CaffeineL1Cache<>(),
         l2,
-        source,
-        source::put,
+        reader,   // 沿用上例：SourceReader 适配真实数据库
+        writer,   // 沿用上例：SourceWriter 写库并返回新版本号
         new CacheAsideReadStrategy<>(new SingleFlight<>()),
-        new CacheAsideWriteStrategy(),
+        new CacheAsideWriteStrategy<>(),
         bus,
-        new SimpleCacheMetrics()
+        new MicrometerCacheMetrics(meterRegistry)   // 生产指标接入 Micrometer
 );
 ```
 
@@ -208,7 +281,8 @@ Cache<String, String> cache = new MultiLevelCache<>(
 | `ReadStrategy` / `WriteStrategy` | 可替换的读写流程 |
 | `FailurePolicy` | 定义缓存层或数据源失败时的处理方式 |
 | `CacheSerializer` | 缓存值序列化与反序列化 |
-| `InvalidationBus` | 发布和订阅缓存失效事件 |
+| `CacheInvalidationPublisher` / `CacheInvalidationSubscriber` | 发布、订阅缓存失效事件 |
+| `CacheInvalidationBus` | 组合发布与订阅的失效总线 |
 
 ### 核心编排
 
@@ -233,10 +307,11 @@ Cache<String, String> cache = new MultiLevelCache<>(
 | --- | --- | --- |
 | L1 | `ConcurrentHashMapL1Cache` | `CaffeineL1Cache` |
 | L2 | `InMemoryL2Cache` | `RedisL2Cache` |
-| 数据源 | `InMemorySourceReader` | 业务自己的数据库或远程服务适配器 |
+| 数据源 | 演示用内存实现（`CacheDemo` 内的 `DemoSource`，同时实现 `SourceReader` / `SourceWriter`） | 业务自己的数据库或远程服务适配器 |
 | 失效总线 | `InMemoryInvalidationBus` | `RedisPubSubInvalidationBus` |
-| 序列化 |  | `JacksonCacheSerializer`、`JacksonEventSerializer` |
-| 指标 | `NoOpCacheMetrics` | `SimpleCacheMetrics` |
+| 序列化 | —（内存实现直接持有对象） | `JacksonCacheSerializer`、`JacksonEventSerializer` |
+| 指标 | `NoOpCacheMetrics` | `MicrometerCacheMetrics` |
+| 失效可靠性 | —（直接发送） | `OutboxInvalidationPublisher`（内存 Outbox + 后台重试） |
 
 ## 关键设计
 
@@ -319,19 +394,21 @@ L1 TTL 通常短于 L2 TTL，避免本地实例长期保留旧数据；真正需
 - [x] 空值缓存与内存布隆过滤器
 - [x] `FailurePolicy` 降级和旧值兜底
 - [x] Testcontainers + Redis 集成测试
+- [x] SLF4J + Logback 统一日志（框架内部已无 `System.out` / `System.err` 打印）
+- [x] Micrometer 指标适配（`MicrometerCacheMetrics`）
+- [x] Outbox 内存版可靠投递（后台重试，见 `OutboxInvalidationPublisher`）
 - [x] 可直接运行的内存演示程序（6 个场景 + 汇总表，见下节）
 
 ### 当前边界
 
-- [ ] `CacheBreakdownGuard` 只有接口，尚未内置 Redisson 实现
+- [ ] `CacheBreakdownGuard` 只有接口，尚未内置 Redisson 等分布式锁实现
 - [ ] 热点 Key 保护尚未实现
 - [ ] 逻辑过期和后台刷新尚未实现
-- [ ] 熔断、限流和完整超时策略尚未接入
+- [ ] 熔断、限流和统一超时策略尚未接入
 - [ ] Redis Pub/Sub 是尽力而为通道，不保证失效事件持久化
-- [ ] Outbox、定时对账和自动补偿尚未实现
-- [ ] 指标目前是内存实现，尚未接入 Micrometer
-- [ ] 日志仍需统一为 SLF4J 结构化日志
-- [ ] 布隆过滤器为内存实现，重启后需要重新构建
+- [ ] Outbox 表存在于内存中，未落库，也没有定时对账与自动补偿
+- [ ] 指标只覆盖命中、未命中、回源、失效等基础计数，没有直方图与告警规则
+- [ ] 布隆过滤器是单实例内存实现，重启后需要重建，尚未接入 Redis 位图
 
 ## 可运行演示（Demo）
 
@@ -418,17 +495,20 @@ mvn -q test
 
 ## 路线图
 
-1. 完善 `FailurePolicy`，增加统一超时、熔断和限流；
-2. 接入 Micrometer 与 SLF4J 结构化日志；
-3. 增加可靠失效通道、Outbox 和定时对账；
-4. 实现逻辑过期、后台刷新和热点 Key 保护；
-5. 增加 JMH 基准测试与 Redis 故障演练；
-6. 接入 `ooohyg-agent`，验证 Agent 会话和工具结果缓存；
-7. 拆分 `core`、`local`、`remote`、`starter` 多模块。
+1. 完善 `FailurePolicy`，补齐统一超时、熔断和限流；
+2. 实现逻辑过期、后台刷新和热点 Key 保护（当前只有 TTL + 抖动）；
+3. 为 `CacheBreakdownGuard` 提供 Redisson 等分布式锁实现（当前仅接口）；
+4. Outbox 落库并增加定时对账与自动补偿（当前为内存表 + 后台重试）；
+5. 布隆过滤器接入 Redis 位图，支持多实例共享与重启恢复（当前为单机内存版）；
+6. 增加 JMH 基准测试与 Redis 故障演练；
+7. 接入 `ooohyg-agent`，验证 Agent 会话和工具结果缓存；
+8. 拆分 `core`、`local`、`remote`、`starter` 多模块。
 
 ## License
 
-本项目基于 Apache License 2.0 发布，详见 [LICENSE](./LICENSE)。
+本项目基于 [Apache License 2.0](./LICENSE) 发布：允许商用、修改与再分发，需保留版权声明与许可文本。第三方组件与致谢明细见 [NOTICE](./NOTICE)。
+
+> 声明：本项目在设计思路上参考了 JetCache 的分层缓存与失效广播模型，**核心代码完全独立实现，未复用 JetCache 的任何源码**。
 
 感谢以下项目提供的工程参考：
 

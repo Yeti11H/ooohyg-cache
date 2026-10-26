@@ -20,6 +20,8 @@ import io.github.ooohyg.distributed.cache.invalidation.CacheInvalidationPublishe
 import io.github.ooohyg.distributed.cache.invalidation.CacheInvalidationSubscriber;
 import io.github.ooohyg.distributed.cache.metrics.CacheMetrics;
 import io.github.ooohyg.distributed.cache.protection.CacheAvalancheGuard;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.Optional;
@@ -30,6 +32,8 @@ import java.util.function.Function;
  * 多级缓存编排器。
  */
 public class MultiLevelCache<K, V> implements Cache<K, V>, CacheInvalidationSubscriber {
+
+    private static final Logger log = LoggerFactory.getLogger(MultiLevelCache.class);
 
     private static final Duration EVENT_ID_TTL = Duration.ofMinutes(5);
     private static final long EVENT_ID_MAX_SIZE = 1_000_000L;
@@ -158,9 +162,8 @@ public class MultiLevelCache<K, V> implements Cache<K, V>, CacheInvalidationSubs
             if (existingFingerprint.equals(fingerprint)) {
                 return;
             } else {
-                System.err.println("eventId collision detected: eventId="
-                        + event.eventId() + ", old=" + existingFingerprint
-                        + ", new=" + fingerprint);
+                log.warn("eventId collision detected: eventId={}, existingFingerprint={}, incomingFingerprint={}",
+                        event.eventId(), existingFingerprint, fingerprint);
                 return;
             }
         }

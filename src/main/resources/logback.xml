@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  默认日志配置：仅控制台输出。
+
+  设计取舍：
+  1. 库本身不写文件——落盘策略（滚动、保留天数、采集）交给使用方的应用决定；
+  2. 默认级别 INFO，框架内部以 WARN/DEBUG 为主，不污染业务日志；
+  3. 显式 UTF-8，避免 Windows GBK 控制台下中文日志乱码。
+-->
+<configuration>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <charset>UTF-8</charset>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- 框架包日志级别：需要排查失效事件链路时可调到 DEBUG -->
+    <logger name="io.github.ooohyg.distributed.cache" level="INFO"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+</configuration>
